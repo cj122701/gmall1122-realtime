@@ -1,0 +1,219 @@
+整体分四部分
+1.Job提交以及Yarn的部署
+
+2.Stage划分以及Task提交
+
+3.Task提交后，如果交给Executor执行
+
+4.Shuffle原理
+~~~~~~~~~~~~~~~~~~~~~~1.Job提交以及Yarn的部署~~~~~~~~~~~~~~~~~~~~~~
+1.1执行Spark提交命令
+	bin/spark-submit \
+	--class com.atguigu.spark.WordCount \
+	--master yarn \
+	WordCount.jar \
+	/input \
+	/output
+
+1.2底层执行的是
+	bin/java org.apache.spark.deploy.SparkSubmit + "$@"
+
+1.3运行SparkSubmit类
+	//java程序执行的入口
+	-main
+		*submit.doSubmit(args)
+			//对参数进行解析  mainClass ==>--class==>WordCount
+			>85	val appArgs = parseArguments(args)
+
+			//执行submit操作
+			>90 case SparkSubmitAction.SUBMIT => submit(appArgs, uninitLog)
+				~doRunMain()
+					!870 runMain
+						//准备提交环境
+						//childMainClass=org.apache.spark.deploy.yarn.YarnClusterApplication
+						//childArgs   --class==>WordCount
+						@871 val (childArgs, childClasspath, sparkConf, childMainClass) 
+								= prepareSubmitEnvironment(args)
+
+						//获取类加载器		
+						@885 val loader = getSubmitClassLoader(sparkConf)	
+
+						//通过反射获取childMainClass类对象==>YarnClusterApplication 
+						@893 mainClass = Utils.classForName(childMainClass)	
+
+						//创建YarnClusterApplication实例
+						@912 mainClass.getConstructor().newInstance().asInstanceOf[SparkApplication]
+
+						//运行YarnClusterApplication实例的start方法
+						@928 app.start(childArgs.toArray, sparkConf)
+							//创建YarnClient对象  并执行run方法
+							#1583 new Client(new ClientArguments(args), conf, null).run()
+								//提交Job，返回ApplicationID
+								$1177 this.appId = submitApplication()
+									//封装AM
+									%196 val containerContext = createContainerLaunchContext(newAppResponse)
+										bin/java org.apache.spark.deploy.yarn.ApplicationMaster
+     								%197 val appContext = createApplicationSubmissionContext(newApp, containerContext)
+     								//提交Job到Yarn集群
+     								%201 yarnClient.submitApplication(appContext)	
+
+1.4 运行org.apache.spark.deploy.yarn.ApplicationMaster
+	-main
+		//封装参数	--class ==>WordCount
+		*842 val amArgs = new ApplicationMasterArguments(args)
+		//执行run方法	
+		*890 master.run()
+			>264 runDriver()
+				~492 userClassThread = startUserApplication()
+					//这里main方法就是WordCount的main方法
+					!718 al mainMethod = userClassLoader.loadClass(args.userClass).getMethod("main", classOf[Array[String]])
+
+					//开启一个新的线程，调用main方法
+					!721 new Thread==>run
+					!728 mainMethod.invoke(null, userArgs.toArray)
+					//给线程取名 Driver	
+					!758 userThread.setName("Driver")
+    				!759 userThread.start()
+
+    			//向RM注册AM	
+    			~507 registerAM(host, port, userConf, sc.ui.map(_.webUrl), appAttemptId)
+
+    			//创建资源分配器
+    			~512 createAllocator(driverRef, userConf, rpcEnv, appAttemptId, distCacheConf)
+    				!465 allocator = client.createAllocator
+    				!479 allocator.allocateResources()
+    					//获取所有的可用资源
+    					@262 val allocatedContainers = allocateResponse.getAllocatedContainers()
+
+    					//处理资源分配的操作
+    					@274 handleAllocatedContainers
+    						#481 runAllocatedContainers(containersToUse)
+    							//判断是否启动Executor
+    							$553 if (runningExecutors.size() < targetNumExecutors)
+    								//执行线程池中的线程的run
+    								%571 new ExecutorRunnable=>run
+    									……68 startContainer()
+    										&205 bin/java org.apache.spark.executor.YarnCoarseGrainedExecutorBackend
+
+
+1.5 运行YarnCoarseGrainedExecutorBackend
+	-main
+		//创建YarnCoarseGrainedExecutorBackend
+		*73 val createFn = new YarnCoarseGrainedExecutorBackend
+
+		*81 CoarseGrainedExecutorBackend.run(backendArgs, createFn)
+			//向RPC体系中添加终端
+			>334 env.rpcEnv.setupEndpoint("Executor", backendCreateFn(env.rpcEnv, arguments, env, cfg.resourceProfile))
+				~136 dispatcher.registerRpcEndpoint(name, endpoint)
+					！77 sharedLoop.register(name, endpoint)
+						//创建收信箱对象
+						@149 val inbox = new Inbox(name, endpoint)
+							//向Inbox发送一条消息，标记位OnStart
+							#inbox.synchronized {
+							#    messages.add(OnStart)
+							#}
+
+							//对收件箱中的消息进行处理
+							#def process(dispatcher: Dispatcher): Unit = {
+								//对OnStart消息进行处理   其实底层调用的是实际创建的终端的onStart方法（CoarseGrainedExecutorBackend）
+								$119 case OnStart => endpoint.onStart()
+									//向Driver反向注册Executor
+									%93 ref.ask[Boolean](RegisterExecutor
+
+
+1.6 Driver端接收Executor端的注册信息并响应
+	SparkContext->SchedulerBackend->CoarseGrainedSchedulerBackend->receiveAndReply
+		listenerBus.post(SparkListenerExecutorAdded(System.currentTimeMillis(), executorId, data))
+        context.reply(true)
+
+1.7 Executor端接收Driver注册消息的反馈
+	147 receive-->
+		 case RegisteredExecutor =>
+	      try {
+	        executor = new Executor(executorId, hostname, env, userClassPath, isLocal = false,esources = _resources)
+	        driver.get.send(LaunchedExecutor(executorId))
+
+
+~~~~~~~~~~~~~~~~~~~~~~2.Stage划分以及Task提交~~~~~~~~~~~~~~~~~~~~~~
+App
+Job
+Stage
+Task
+2.1 划分阶段
+	触发行动算子
+		*runJob=>2093 dagScheduler.runJob
+			>742 val waiter = submitJob
+				~714 eventProcessLoop.post(JobSubmitted)
+					！doOnReceive
+						@dagScheduler.handleJobSubmitted
+							#986 finalStage = createResultStage(finalRDD, func, partitions, jobId, callSite)
+								% val parents = getOrCreateParentStages(rdd, jobId)
+									……467 getShuffleDependencies(rdd)
+									……468 getOrCreateShuffleMapStage(shuffleDep, firstJobId)
+										//获取更久远的宽依赖
+										&getMissingAncestorShuffleDependencies(shuffleDep.rdd)
+											*createShuffleMapStage(dep, firstJobId)
+
+2.2 提交阶段
+	-submitStage(stage: Stage)
+		*submitMissingTasks(stage, jobId.get)
+			& if (tasks.nonEmpty) 
+				$taskScheduler.submitTasks(new TaskSet(tasks.toArray)
+
+
+~~~~~~~~~~~~~~~~~~~~~~3.Task提交后，如果交给Executor执行~~~~~~~~~~~~~~~~~~~~~~
+3.1  Driver提交
+	-DAGScheduler
+		*1109 submitMissingTasks
+			//将Task封装到TaskSet中，并通过taskScheduler进行调度
+			>taskScheduler.submitTasks(new TaskSet(tasks))
+				//将TaskSet交给TaskSetManager进行管理
+				~219 val manager = createTaskSetManager(taskSet, maxTaskFailures)
+
+				//将TaskSetManager放到调度队列中去
+				//FIFOSchedulableBuilder
+				//FairSchedulableBuilder
+				~237 schedulableBuilder.addTaskSetManager(manager, manager.taskSet.properties)
+
+				//准备让Driver终端处理请求	
+				~254 backend.reviveOffers()
+					//给Driver终端自己发条消息，标记位ReviveOffers
+					!driverEndpoint.send(ReviveOffers)
+
+				~在Driver终端backend中的receive对ReviveOffers进行处理
+					！170 makeOffers()
+						//将可用的Executor进行封装，封装为wordOffers
+						@val workOffers = activeExecutors.map
+						//准备分配任务（资源的绑定）
+						@300scheduler.resourceOffers(workOffers)
+
+						//运行Tasks
+						@launchTasks(taskDescs)
+							//对任务进行序列化
+							#val serializedTask = TaskDescription.encode(task)
+							//Driver终端发送执行Task请求	
+							#executorData.executorEndpoint.send(LaunchTask(new SerializableBuffer(serializedTask)))
+
+3.2 Executor接收Driver的Task，并运行
+	-Executor终端的receiver方法匹配LaunchTask并进行处理
+		//反序列化
+		*163 val taskDesc = TaskDescription.decode(data.value)
+		//executor运行Task
+		*166 executor.launchTask(this, taskDesc)
+			>TaskRunner的run方法
+				~440 val res = task.run
+					!runTask(context)
+						@ShuffleMapTask
+							#runTask
+						@ResultTask
+							#runTask
+
+~~~~~~~~~~~~~~~~~~~~~~4.Shuffle相关源码~~~~~~~~~~~~~~~~~~~~~~
+-ShuffleMapTask
+	*runTask
+
+
+
+-不排序的条件
+	*map端没有预聚合
+	*map端最后一个rdd的分区数小于等于200（spark.shuffle.sort.bypassMergeThreshold）
